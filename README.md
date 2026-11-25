@@ -9,19 +9,19 @@
 ## 核心特性
 
 1. **子代理树（总览）**：
-   - 自动从当前子会话向上溯源至 `rootConversationId` 并向下递归构建整棵子代理树；
+   - 自动从当前子会话向上溯源至 `rootConversationId` 并向下递归构建整棵子代理树；支持原生 `/swarm` 的 `.system_generated/swarm/{swarm.json,members.json,plan.json}` 融合补全（即使无 `subagents/` 目录也能识别全部 Swarm 成员并同步 `killed` 状态，自动清洗 `Swarm Worker (...)` 包裹名并展示 Swarm 轻量目标摘要条）；
    - 置顶「正在执行 / 需关注（报错或上下文 ≥ 75%）」焦点区，运行中节点附带原生流光动效；
-   - 单色极简层级树，对齐展示每个节点的**状态点**、**角色名**、**实际使用模型**（如 `Hydrogen · High`、`Neon · XHigh`）、**上下文水位微条**与**中文化动作摘要**（自动剥离冗长工作区前缀与冗余 `cd`）；
-   - 支持按角色/模型/活动检索、隐藏已终止节点、一键切入原会话。
+   - 单色极简层级树，对齐展示每个节点的**状态点**、**角色名**（悬浮提示附带 Swarm 分配任务）、**实际使用模型**（如 `Hydrogen · High`、`Neon · XHigh`）、**上下文水位微条**与**中文化动作摘要**（自动剥离冗长工作区前缀与冗余 `cd`，将空闲等待 `swarm_wait` 降级为更有意义的最近发帖/工作摘要）；
+   - 支持按角色/模型/活动检索、隐藏已终止节点、一键切入原会话，并在筛选器隐藏全部节点时提供一键「重置筛选」（切换根会话时自动重置残留筛选条件）。
 2. **容器宽度自适应（Master-Detail）**：
    - 窄侧栏（`< 680px`）下采用分步导航，详情页固定 Sticky 顶栏（`← 返回总览` 随时可见，支持 `Esc` 返回并恢复滚动位置）；
    - 拉宽侧栏（`>= 680px`）自动切换为左树右详情双栏联动视图。
 3. **可读性优化的对话流与上下文拆解**：
-   - 自动将 `<SYSTEM_MESSAGE>` 中包裹的代理间派单与回报拆包为清晰的「来自 `<发送方>`」消息卡片（Cron 心跳自动折叠）；
-   - 还原双重转义参数，将 `send_message` / `invoke_subagent` / `write_file(.md)` 渲染为可读 Markdown，剔除重复时间戳并将纯状态返回收敛为行尾徽标；
+   - 自动将 `<SYSTEM_MESSAGE>` 中包裹的代理间派单与回报拆包为清晰的「来自 `<发送方>`」消息卡片（Cron 心跳自动折叠）；针对 `/swarm` 的 `[swarm] new board message #N` 唤醒自动关联 `board.jsonl` 还原为「`群板 #N · 来自 <发送方>`」及真实群聊正文；
+   - 还原双重转义参数，将 `send_message` / `invoke_subagent` / `post_message` / `swarm` / `write_file(.md)` 渲染为可读 Markdown，语义化展示 `read_board` / `swarm_wait` / `manage_task`，剔除重复时间戳并将纯状态返回（含 `Posted #N` 等）收敛为行尾徽标；
    - 内置单代理上下文分层明细（System Prompt / Rules / Skills / MCP / Chat 及最重步骤 Top 8）与智能滚底（上滑自动停止强拽并浮现 `↓ 最新` 胶囊）。
 4. **消息板与 Teamwork 工件预览**：
-   - 聚合整棵树内所有 `.system_generated/messages/*.json` 跨节点消息流，支持按成员过滤与隐藏 Cron 心跳；
+   - 聚合整棵树内 `.system_generated/messages/*.json` 与原生 `/swarm` 的 `.system_generated/swarm/board.jsonl` 真实群板消息（带 `#seq` 单色序号与 `群板` 标签，自动去重 `[swarm] new board message #N` 唤醒噪音），支持按成员过滤与隐藏 Cron 心跳；
    - 检测到 `scratch/teamwork/<id>/.agents/teamwork/` 时自动显示「工件」Tab，支持按分类预览 `PROJECT.md`、`progress.md`、`handoff.md` 等并一键在侧栏打开原文件。
 
 ---
@@ -59,6 +59,7 @@ node --check \
   sidecars/subagent_board/main.mjs \
   sidecars/subagent_board/lib/format_helpers.mjs \
   sidecars/subagent_board/lib/ls_client.mjs \
+  sidecars/subagent_board/lib/swarm_reader.mjs \
   sidecars/subagent_board/lib/tree_scanner.mjs \
   sidecars/subagent_board/lib/transcript_reader.mjs \
   sidecars/subagent_board/app.js

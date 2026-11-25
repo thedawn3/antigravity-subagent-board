@@ -19,7 +19,7 @@ description: 打开子代理组可视化看板或巡检当前会话的整棵子�
 
 如需在对话内直接输出巡检摘要，可按以下只读路径检查当前会话及其根/子会话数据（严禁修改或写入）：
 
-1. **定位子代理元数据**：检查 `~/.gemini/antigravity/brain/<conversationId>/.system_generated/subagents/*.json`（包含 `subagentDescriptor.typeName`、`subagentDescriptor.role`、`state`、`spawnStepIndex`），并可递归追踪子代理目录下的同级 `subagents/`。
+1. **定位子代理元数据**：检查 `~/.gemini/antigravity/brain/<conversationId>/.system_generated/subagents/*.json`（包含 `subagentDescriptor.typeName`、`subagentDescriptor.role`、`state`、`spawnStepIndex`），并可递归追踪子代理目录下的同级 `subagents/`。若为原生 `/swarm` 会话（即使不存在 `subagents/` 目录），还需检查根会话的 `~/.gemini/antigravity/brain/<rootConversationId>/.system_generated/swarm/{swarm.json,members.json,plan.json}` 获取完整成员列表、模型、工作区模式、任务分配与 `killed` 状态。
 2. **检查活动与模型/Token**：读取对应子代理的 `~/.gemini/antigravity/brain/<childId>/.system_generated/logs/transcript.jsonl` 尾部 `PLANNER_RESPONSE`（含 `model`、`input_tokens`、`cache_read_tokens`、`output_tokens`、`tool_calls`、`status`）。
-3. **检查代理间消息**：读取 `.system_generated/messages/*.json`（忽略 `read.json`），汇总 `sender`、`recipient`、`timestamp` 与 `renderDetails.messageTitle`。
+3. **检查代理间消息与群板**：读取 `.system_generated/messages/*.json`（忽略 `read.json`），汇总 `sender`、`recipient`、`timestamp` 与 `renderDetails.messageTitle`；若存在 `~/.gemini/antigravity/brain/<rootConversationId>/.system_generated/swarm/board.jsonl`，直接读取各行 `{ seq, agent, text, time, kind }` 以还原真实群聊消息内容，避免仅看到 `[swarm] new board message #N` 唤醒壳。
 4. **检查 Teamwork 工件**：若存在 `~/.gemini/antigravity/scratch/teamwork/<id>/.agents/teamwork/`，只读查看 `PROJECT.md` 与各节点的 `progress.md` / `handoff.md`。

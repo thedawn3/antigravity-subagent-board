@@ -258,6 +258,13 @@ export function cleanToolOutputText(rawText, roleById = {}, maxChars = 3600) {
       const targetLabel = roleById[targetId] || targetId.slice(0, 8);
       return { text: '', shortStatus: `已发送给 ${targetLabel}`, durationText, totalChars: 0, truncated: false };
     }
+    const postedNum = /^Posted(?:\s+message)?\s+#(\d+)\.?$/i.exec(nonSepLines[0]);
+    if (postedNum) {
+      return { text: '', shortStatus: `已发帖 #${postedNum[1]}`, durationText, totalChars: 0, truncated: false };
+    }
+    if (/^(?:Message\s+posted|Posted(?:\s+to\s+board)?)\.?$/i.test(nonSepLines[0])) {
+      return { text: '', shortStatus: '已发群消息', durationText, totalChars: 0, truncated: false };
+    }
     if (/^OK\.?$/i.test(nonSepLines[0])) {
       return { text: '', shortStatus: '已更新', durationText, totalChars: 0, truncated: false };
     }

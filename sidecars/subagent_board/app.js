@@ -527,9 +527,37 @@
     loadAgentDetail(convId, state.agentLimit, { allowAutoScroll: true });
   }
 
-  // ---------- 1. 顶部摘要与 Popover ----------
+  // ---------- 1. 顶部摘要、Swarm 摘要条与 Popover ----------
+  function renderSwarmBanner(group) {
+    const el = $('swarm-banner');
+    if (!el) return;
+    const sw = group?.swarm;
+    if (!sw?.detected) {
+      el.classList.add('hidden');
+      el.innerHTML = '';
+      return;
+    }
+
+    const title = sw.title || sw.goalTitle || 'Swarm 协作';
+    const goal = sw.goalLine || (sw.title && sw.goalTitle && sw.goalTitle !== sw.title ? sw.goalTitle : '');
+    const metaParts = [];
+    if (sw.membersCount != null) metaParts.push(`${sw.membersCount} 成员`);
+    if (sw.boardCount != null) metaParts.push(`${sw.boardCount} 群帖`);
+
+    el.classList.remove('hidden');
+    el.innerHTML = `
+      <div class="swarm-banner-head">
+        <span class="swarm-badge">Swarm</span>
+        <span class="swarm-title" title="${esc(title)}">${esc(title)}</span>
+        ${metaParts.length ? `<span class="swarm-meta mono">${esc(metaParts.join(' · '))}</span>` : ''}
+      </div>
+      ${goal ? `<div class="swarm-goal" title="${esc(goal)}">${esc(goal)}</div>` : ''}
+    `;
+  }
+
   function renderSummary(group) {
     const sum = group.summary;
+    const sw = group.swarm;
     const sig = JSON.stringify([
       group.rootTitle,
       sum.totalAgents,
@@ -543,9 +571,17 @@
       sum.peakContext?.usedPct,
       group.messages?.length,
       group.teamwork?.docs?.length,
+      sw?.detected,
+      sw?.title,
+      sw?.goalTitle,
+      sw?.goalLine,
+      sw?.boardCount,
+      sw?.membersCount,
     ]);
     if (state.sigs.summary === sig) return;
     state.sigs.summary = sig;
+
+    renderSwarmBanner(group);
 
     const title = group.rootTitle || group.rootConversationId.slice(0, 8);
     $('root-title').textContent = title;
@@ -650,7 +686,8 @@
         node.role.toLowerCase().includes(q) ||
         node.typeName.toLowerCase().includes(q) ||
         node.modelLabel.toLowerCase().includes(q) ||
-        (node.currentActivity || '').toLowerCase().includes(q)
+        (node.currentActivity || '').toLowerCase().includes(q) ||
+        (node.swarmTask || '').toLowerCase().includes(q)
       );
     };
     const hasMatchInSubtree = (node) => matchesSelf(node) || (node.children || []).some(hasMatchInSubtree);
@@ -683,7 +720,16 @@
       onlyActive,
       state.selectedAgentId,
       Array.from(state.collapsedNodes).sort(),
-      (group.nodes || []).map((n) => [n.conversationId, n.status, n.modelLabel, n.stepCount, n.context.usedTokens, n.currentActivity]),
+      (group.nodes || []).map((n) => [
+        n.conversationId,
+        n.status,
+        n.modelLabel,
+        n.stepCount,
+        n.context.usedTokens,
+        n.currentActivity,
+        n.swarmTask || '',
+        n.swarmWorkspaceMode || '',
+      ]),
     ]);
     if (state.sigs.tree === treeSig) return;
     state.sigs.tree = treeSig;
@@ -692,7 +738,24 @@
     const rows = flattenVisibleTree(group.tree, query, hideKilled, onlyActive);
 
     if (!rows.length) {
-      $('tree-list').innerHTML = '<div class="empty-body" style="padding:28px 0;text-align:center">没有匹配的子代理节点</div>';
+      const totalNodes = (group.nodes || []).length;
+      if (totalNodes > 0) {
+        $('tree-list').innerHTML = `
+          <div class="tree-empty-reset">
+            <div class="empty-body">当前筛选条件隐藏了全部 ${totalNodes} 个节点</div>
+            <button type="button" id="btn-reset-tree-filters" class="reset-filter-btn">重置筛选</button>
+          </div>
+        `;
+        $('btn-reset-tree-filters').addEventListener('click', () => {
+          $('tree-search').value = '';
+          $('tree-hide-killed').checked = false;
+          $('tree-only-active').checked = false;
+          state.sigs.tree = '';
+          renderTree();
+        });
+      } else {
+        $('tree-list').innerHTML = '<div class="empty-body" style="padding:28px 0;text-align:center">没有匹配的子代理节点</div>';
+      }
       return;
     }
 
@@ -710,6 +773,9 @@
         if (ctx.cacheHitRate != null) statsParts.push(`缓存${ctx.cacheHitRate}%`);
         const rel = fmtRelTime(node.lastActivityAt);
         if (rel) statsParts.push(rel);
+        const roleTitleParts = [`${node.role} (${node.typeName})`];
+        if (node.swarmWorkspaceMode) roleTitleParts.push(`工作区: ${node.swarmWorkspaceMode}`);
+        if (node.swarmTask) roleTitleParts.push(`任务: ${node.swarmTask}`);
 
         return `
           <div class="tree-row ${node.status === 'killed' ? 'killed' : ''} ${isSelected ? 'selected' : ''}"
@@ -722,7 +788,7 @@
                   : '<span class="fold-spacer"></span>'
               }
               <span class="status-dot ${esc(node.status)}" title="${esc(STATUS_TEXT[node.status] || node.status)}"></span>
-              <span class="row-role" title="${esc(node.role)} (${esc(node.typeName)})">${esc(node.role)}</span>
+              <span class="row-role" title="${esc(roleTitleParts.join(' · '))}">${esc(node.role)}</span>
               ${node.isActiveView ? '<span class="row-cur-tag">当前</span>' : ''}
               <span class="row-model" title="${esc(node.modelLabel)}">${esc(node.shortModelLabel || node.modelLabel)}</span>
               <span class="row-ctx mono ${lvlCls}" title="${fmtTok(ctx.usedTokens)} / ${fmtTok(ctx.maxContextTokens)}">
@@ -778,12 +844,14 @@
     const q = ($('msg-search').value || '').trim().toLowerCase();
     $('msg-filter-toggle').classList.toggle('active', Boolean(prevAgent) || !hideCron);
 
+    const lastMsg = group.messages?.length ? group.messages[group.messages.length - 1] : null;
     const msgSig = JSON.stringify([
       prevAgent,
       hideCron,
       q,
       group.messages?.length,
-      group.messages?.length ? group.messages[group.messages.length - 1].id : '',
+      lastMsg ? [lastMsg.id, lastMsg.seq ?? null, lastMsg.timestamp || '', lastMsg.content?.length || 0] : '',
+      (group.nodes || []).map((n) => `${n.conversationId}:${n.role}`),
       Array.from(state.expandedLongKeys).filter((k) => k.startsWith('msg:')).sort(),
     ]);
     if (state.sigs.messages === msgSig) return;
@@ -792,7 +860,7 @@
     sel.innerHTML = ['<option value="">全部代理</option>']
       .concat((group.nodes || []).map((n) => `<option value="${esc(n.conversationId)}">${esc(n.role)}</option>`))
       .join('');
-    sel.value = prevAgent;
+    sel.value = prevAgent && (group.nodes || []).some((n) => n.conversationId === prevAgent) ? prevAgent : '';
 
     const filtered = (group.messages || []).filter((m) => {
       if (hideCron && m.isCron) return false;
@@ -806,19 +874,27 @@
       return;
     }
 
-    const KIND_LABELS = { spawn: '派单', cron: 'Cron', message: '消息' };
+    const KIND_LABELS = { spawn: '派单', cron: 'Cron', message: '消息', board: '群板' };
     $('msg-list').innerHTML = filtered
       .map((m) => {
         const longKey = `msg:${m.id}`;
         const isOpen = state.expandedLongKeys.has(longKey);
         const isLong = m.content.length > 280 || m.content.split('\n').length > 6;
+        const seqBadge = m.seq != null ? `<span class="msg-seq">#${esc(m.seq)}</span>` : '';
+        const senderHtml = m.senderConvId
+          ? `<button type="button" class="agent-link" data-jump-agent="${esc(m.senderConvId)}">${esc(m.senderLabel)}</button>`
+          : `<span class="msg-recip-static">${esc(m.senderLabel || '未知')}</span>`;
+        const recipientHtml = m.recipientConvId
+          ? `<button type="button" class="agent-link" data-jump-agent="${esc(m.recipientConvId)}">${esc(m.recipientLabel)}</button>`
+          : `<span class="msg-recip-static">${esc(m.recipientLabel || '全体')}</span>`;
         return `
           <article class="msg">
             <div class="msg-head">
               <div class="msg-who">
-                <button type="button" class="agent-link" data-jump-agent="${esc(m.senderConvId)}">${esc(m.senderLabel)}</button>
+                ${seqBadge}
+                ${senderHtml}
                 <span class="msg-arrow">→</span>
-                <button type="button" class="agent-link" data-jump-agent="${esc(m.recipientConvId)}">${esc(m.recipientLabel)}</button>
+                ${recipientHtml}
                 <span class="msg-kind">${KIND_LABELS[m.kind] || ''}</span>
               </div>
               <span class="msg-ts mono">${esc(fmtClock(m.timestamp))}</span>
@@ -901,6 +977,7 @@
       newLastStep,
       lastEv?.outputTokens,
       lastEv?.toolOutput?.totalChars,
+      lastEv?.boardSeq ?? null,
       detail.context?.usedTokens,
       state.showBreakdown,
       showTools,
@@ -981,9 +1058,10 @@
           const longKey = `in:${detail.conversationId}:${ev.stepIndex}:${ev.subIndex || 0}`;
           const isOpen = state.expandedLongKeys.has(longKey);
           const isLong = ev.content.length > 320 || ev.content.split('\n').length > 6;
+          const senderText = ev.boardSeq != null ? `群板 #${ev.boardSeq} · 来自 ${ev.senderLabel}` : `来自 ${ev.senderLabel}`;
           const senderBtn = ev.senderId
-            ? `<button type="button" class="agent-link" style="font-size:12px" data-jump-sender="${esc(ev.senderId)}">来自 ${esc(ev.senderLabel)}</button>`
-            : `<strong>来自 ${esc(ev.senderLabel)}</strong>`;
+            ? `<button type="button" class="agent-link" style="font-size:12px" data-jump-sender="${esc(ev.senderId)}">${esc(senderText)}</button>`
+            : `<strong>${esc(senderText)}</strong>`;
           return `
             <div class="turn-incoming">
               <div class="turn-meta">${senderBtn}<span class="mono">#${ev.stepIndex} · ${esc(timeStr)}</span></div>
@@ -1261,7 +1339,7 @@
         return;
       }
 
-      // 切换到了另一组会话时重置视图状态
+      // 切换到了另一组会话时重置视图状态与筛选器
       if (state.lastRootId && state.lastRootId !== data.rootConversationId) {
         state.detailOpen = false;
         state.selectedAgentId = '';
@@ -1270,8 +1348,16 @@
         state.agentLastStepIdx = -1;
         state.selectedTwPath = '';
         state.collapsedNodes.clear();
+        state.allCollapsed = false;
+        $('btn-toggle-expand').textContent = '全部折叠';
         state.openDetailsKeys.clear();
         state.expandedLongKeys.clear();
+        $('tree-search').value = '';
+        $('tree-hide-killed').checked = false;
+        $('tree-only-active').checked = false;
+        $('msg-search').value = '';
+        $('msg-agent-filter').value = '';
+        document.querySelectorAll('.filter-toggle.active').forEach((el) => el.classList.remove('active'));
         state.sigs = { summary: '', tree: '', messages: '', detail: '', teamwork: '' };
         $('workspace').classList.remove('detail-open');
       }

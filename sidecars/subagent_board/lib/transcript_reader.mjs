@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+  cleanActivitySummary,
   cleanToolOutputText,
   deepUnquoteString,
   parseSystemMessageEnvelope,
@@ -47,7 +48,9 @@ function toFileUriSafe(rawPath, lineSuffix = '') {
   }
 }
 
-function buildToolCallSemantic(tc, workspaceRoots, roleById) {
+const SWARM_NUDGE_RE = /^\[swarm\]\s+new board message #(\d+)/i;
+
+export function buildToolCallSemantic(tc, workspaceRoots = [], roleById = {}) {
   const name = tc?.name || 'tool';
   const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
   const desc = describeToolCall(tc, workspaceRoots, roleById);
@@ -65,6 +68,42 @@ function buildToolCallSemantic(tc, workspaceRoots, roleById) {
     target = rLabel ? `→ ${rLabel}` : '发送消息';
     previewKind = 'markdown';
     previewText = getStr('Message');
+  } else if (name === 'post_message') {
+    const rawText = getStr('text');
+    const trimmed = rawText.trim();
+    const leadMention = /^(@#?[a-z0-9][a-z0-9_-]*)/i.exec(trimmed);
+    const firstLine = trimmed.split(/\r?\n/).find((l) => l.trim()) || '';
+    target = leadMention ? leadMention[1] : cleanActivitySummary(firstLine, workspaceRoots, roleById, 52) || '群板消息';
+    previewKind = trimmed ? 'markdown' : 'none';
+    previewText = rawText;
+  } else if (name === 'swarm') {
+    const action = getStr('action').trim().toLowerCase();
+    if (action === 'add') {
+      target = getStr('name').trim() || '成员';
+      const brief = getStr('brief');
+      previewKind = brief.trim() ? 'markdown' : 'none';
+      previewText = brief;
+    } else {
+      previewKind = 'none';
+      previewText = '';
+    }
+  } else if (name === 'read_board') {
+    const since = getStr('since').trim();
+    const seqs = getStr('seqs').trim();
+    target = since ? `since #${since}` : seqs ? `seqs ${seqs}` : '全部';
+    previewKind = 'none';
+    previewText = '';
+  } else if (name === 'swarm_wait') {
+    const since = getStr('since').trim();
+    target = since ? `等待 #${since} 之后` : '等待新消息';
+    previewKind = 'none';
+    previewText = '';
+  } else if (name === 'manage_task') {
+    const action = (getStr('Action') || getStr('action')).trim();
+    const taskId = (getStr('TaskId') || getStr('taskId')).trim();
+    target = [action, taskId].filter(Boolean).join(' ') || '管理';
+    previewKind = 'none';
+    previewText = '';
   } else if (name === 'invoke_subagent') {
     const role = getStr('Role').trim();
     const typeName = getStr('TypeName').trim();
@@ -174,7 +213,10 @@ function resolveIncomingSender(rawSender, roleById) {
   };
 }
 
-function parseTranscriptEvents(transcriptPath, { limit = 150, beforeStep = null, workspaceRoots = [], roleById = {} } = {}) {
+export function parseTranscriptEvents(
+  transcriptPath,
+  { limit = 150, beforeStep = null, workspaceRoots = [], roleById = {}, swarmBoardBySeq = null } = {},
+) {
   if (!transcriptPath || !existsSync(transcriptPath)) {
     return { events: [], totalEvents: 0, hasMore: false, oldestStepIndex: null, lastPlanner: null };
   }
@@ -217,18 +259,39 @@ function parseTranscriptEvents(transcriptPath, { limit = 150, beforeStep = null,
         for (let mIdx = 0; mIdx < env.messages.length; mIdx += 1) {
           const msg = env.messages[mIdx];
           const senderInfo = resolveIncomingSender(msg.sender, roleById);
-          allEvents.push({
+          let senderId = senderInfo.senderId;
+          let senderLabel = senderInfo.senderLabel;
+          let content = msg.content;
+          let boardSeq;
+
+          const nudgeMatch = SWARM_NUDGE_RE.exec(String(msg.content || '').trim());
+          if (nudgeMatch && swarmBoardBySeq) {
+            const seqNum = Number(nudgeMatch[1]);
+            const boardEntry = swarmBoardBySeq instanceof Map ? swarmBoardBySeq.get(seqNum) : swarmBoardBySeq[seqNum];
+            if (boardEntry) {
+              senderId = boardEntry.senderConvId || senderId;
+              senderLabel = boardEntry.senderLabel || senderLabel;
+              content = boardEntry.content || content;
+              boardSeq = seqNum;
+            }
+          }
+
+          const ev = {
             kind: 'incoming_message',
             stepIndex,
             subIndex: mIdx,
             createdAt: msg.timestamp || obj.created_at || '',
             status: obj.status || 'DONE',
-            senderId: senderInfo.senderId,
-            senderLabel: senderInfo.senderLabel,
-            isCron: senderInfo.isCron || /^\[Cron\b/i.test(msg.content),
+            senderId,
+            senderLabel,
+            isCron: senderInfo.isCron || /^\[Cron\b/i.test(content),
             priority: msg.priority || '',
-            content: msg.content,
-          });
+            content,
+          };
+          if (boardSeq != null) {
+            ev.boardSeq = boardSeq;
+          }
+          allEvents.push(ev);
         }
       } else if (env.content) {
         allEvents.push({
@@ -347,12 +410,14 @@ export async function readAgentDetail(conversationId, { limit = 150, beforeStep 
 
   const workspaceRoots = groupCtx?.workspaceRoots || [];
   const roleById = groupCtx?.roleById || {};
+  const swarmBoardBySeq = groupCtx?.swarmBoardBySeq || null;
 
   const parsed = parseTranscriptEvents(tpPath, {
     limit,
     beforeStep,
     workspaceRoots,
     roleById,
+    swarmBoardBySeq,
   });
 
   const gens = Array.isArray(genRes?.generatorMetadata) ? genRes.generatorMetadata : [];
@@ -363,7 +428,13 @@ export async function readAgentDetail(conversationId, { limit = 150, beforeStep 
   const steps = Array.isArray(trajRes?.trajectory?.steps) ? trajRes.trajectory.steps : [];
 
   const genModelId = usage?.model || chatModel?.model || '';
-  const modelLabel = formatModelLabel(genModelId, chatModel?.modelDisplayName, parsed.lastPlanner?.model, catalog);
+  const fallbackModel = groupCtx?.swarmModelByConvId?.[conversationId] || '';
+  const modelLabel = formatModelLabel(
+    genModelId,
+    chatModel?.modelDisplayName,
+    parsed.lastPlanner?.model || fallbackModel,
+    catalog,
+  );
   const maxContextTokens = Number(cwm?.maxContextTokens) || 512000;
 
   // 构建分层上下文结构

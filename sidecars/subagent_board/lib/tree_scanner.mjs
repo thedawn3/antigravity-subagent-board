@@ -19,6 +19,7 @@ import {
   stripRedundantCd,
 } from './format_helpers.mjs';
 import { formatModelLabel, getConversation, getGeneratorMetadata, getModelCatalog, runWithConcurrency } from './ls_client.mjs';
+import { clearSwarmReaderCaches, readSwarmBoard, readSwarmMetadata, stripSwarmRoleWrapper } from './swarm_reader.mjs';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ID_RE = /^[0-9a-f-]{8,}$/i;
@@ -58,6 +59,19 @@ function lruSet(map, key, value, maxEntries) {
   if (map.size > maxEntries) {
     map.delete(map.keys().next().value);
   }
+}
+
+/**
+ * 测试辅助：清空扫描器全部内存缓存。
+ */
+export function clearScannerCaches() {
+  subagentFileCache.clear();
+  messageFileCache.clear();
+  transcriptSummaryCache.clear();
+  lsNodeCache.clear();
+  groupContextByConv.clear();
+  reverseParentCache = { builtAt: 0, childToParent: new Map() };
+  clearSwarmReaderCaches();
 }
 
 export function resolveAppDataDirs() {
@@ -134,13 +148,31 @@ function getChildToParentIndex() {
     const brainDir = join(appDataDir, 'brain');
     for (const parentId of safeReaddir(brainDir)) {
       if (!ID_RE.test(parentId)) continue;
-      const subDir = join(brainDir, parentId, '.system_generated', 'subagents');
+      const parentConvDir = join(brainDir, parentId);
+      const subDir = join(parentConvDir, '.system_generated', 'subagents');
       for (const fn of safeReaddir(subDir)) {
         if (!fn.endsWith('.json')) continue;
         const data = readJsonCached(subagentFileCache, join(subDir, fn), 1024);
         const childId = data?.conversationId || fn.replace(/\.json$/, '');
         if (childId && ID_RE.test(childId)) {
           childToParent.set(childId, parentId);
+        }
+      }
+
+      const swarmMeta = readSwarmMetadata(parentConvDir);
+      if (swarmMeta.detected) {
+        for (const worker of swarmMeta.orderedWorkers) {
+          const childId = worker.conversationId;
+          if (!childId || !ID_RE.test(childId) || childId === parentId || childToParent.has(childId)) continue;
+          let targetParent = parentId;
+          if (worker.addedBy) {
+            const byName = swarmMeta.convIdByName.get(worker.addedBy);
+            const candidate = byName || (swarmMeta.membersByConvId.has(worker.addedBy) ? worker.addedBy : '');
+            if (candidate && candidate !== childId && ID_RE.test(candidate)) {
+              targetParent = candidate;
+            }
+          }
+          childToParent.set(childId, targetParent);
         }
       }
     }
@@ -196,6 +228,12 @@ const TOOL_ACTION_LABELS = {
   update_focus: '状态',
   enter_plan_mode: '规划',
   exit_plan_mode: '规划',
+  swarm: 'Swarm',
+  post_message: '发群消息',
+  read_board: '读取消息板',
+  swarm_wait: '等待群消息',
+  manage_task: '后台任务',
+  schedule: '定时任务',
 };
 
 /**
@@ -220,6 +258,101 @@ export function describeToolCall(toolCall, workspaceRoots = [], roleById = {}) {
   const name = toolCall.name || '';
   if (!name) return { actionLabel: '', target: '', brief: '' };
   const args = toolCall.args && typeof toolCall.args === 'object' ? toolCall.args : {};
+
+  if (name === 'swarm') {
+    const action = deepUnquoteString(args.action).trim().toLowerCase();
+    const memberName = deepUnquoteString(args.name).trim();
+    const titleStr = deepUnquoteString(args.title).trim();
+    const modelStr = deepUnquoteString(args.model).trim();
+    if (action === 'add') {
+      return {
+        actionLabel: 'Swarm 派员',
+        target: memberName || '成员',
+        brief: memberName ? `Swarm 派员 ${memberName}` : 'Swarm 派员',
+      };
+    }
+    if (action === 'status') {
+      return { actionLabel: 'Swarm 状态', target: '查看成员状态', brief: '查看 Swarm 状态' };
+    }
+    if (action === 'title') {
+      return {
+        actionLabel: 'Swarm 标题',
+        target: titleStr || '设置标题',
+        brief: titleStr ? `Swarm 标题 ${titleStr}` : '设置 Swarm 标题',
+      };
+    }
+    if (action === 'kill') {
+      return {
+        actionLabel: 'Swarm 终止',
+        target: memberName || '成员',
+        brief: memberName ? `Swarm 终止 ${memberName}` : '终止 Swarm 成员',
+      };
+    }
+    if (action === 'model') {
+      const mTarget = [memberName, modelStr].filter(Boolean).join(' → ') || '切换模型';
+      return { actionLabel: 'Swarm 切模', target: mTarget, brief: `Swarm 切模 ${mTarget}` };
+    }
+    return {
+      actionLabel: 'Swarm',
+      target: action || '操作',
+      brief: action ? `Swarm ${action}` : 'Swarm',
+    };
+  }
+
+  if (name === 'post_message') {
+    const rawText = deepUnquoteString(args.text).trim();
+    const firstLine = rawText.split(/\r?\n/).find((l) => l.trim()) || '';
+    const summary = cleanActivitySummary(firstLine, workspaceRoots, roleById, 52);
+    return {
+      actionLabel: '发群消息',
+      target: summary || '群板消息',
+      brief: summary ? `发群消息 ${summary}` : '发群消息',
+    };
+  }
+
+  if (name === 'read_board') {
+    const since = deepUnquoteString(args.since).trim();
+    const seqs = deepUnquoteString(args.seqs).trim();
+    const t = since ? `since #${since}` : seqs ? `seqs ${seqs}` : '全部';
+    return {
+      actionLabel: '读取消息板',
+      target: t,
+      brief: since ? `读取消息板 (since #${since})` : '读取消息板',
+    };
+  }
+
+  if (name === 'swarm_wait') {
+    const since = deepUnquoteString(args.since).trim();
+    const t = since ? `等待 #${since} 之后` : '等待新消息';
+    return {
+      actionLabel: '等待群消息',
+      target: t,
+      brief: since ? `等待群消息 (#${since}+)` : '等待群消息',
+    };
+  }
+
+  if (name === 'manage_task') {
+    const action = deepUnquoteString(args.Action || args.action).trim();
+    const taskId = deepUnquoteString(args.TaskId || args.taskId).trim();
+    const t = [action, taskId].filter(Boolean).join(' ') || '管理';
+    return {
+      actionLabel: '后台任务',
+      target: t,
+      brief: `后台任务 ${t}`,
+    };
+  }
+
+  if (name === 'schedule') {
+    const cron = deepUnquoteString(args.CronExpression || args.cronExpression).trim();
+    const dur = deepUnquoteString(args.DurationSeconds || args.durationSeconds).trim();
+    const prompt = deepUnquoteString(args.Prompt || args.prompt).trim();
+    const t = cron || (dur ? `${dur}s` : '') || cleanActivitySummary(prompt, workspaceRoots, roleById, 44);
+    return {
+      actionLabel: '定时任务',
+      target: t || '调度',
+      brief: t ? `定时任务 ${t}` : '定时任务',
+    };
+  }
 
   let target = '';
   const rawPath = deepUnquoteString(args.Path || args.AbsolutePath || args.TargetFile || '').trim();
@@ -303,10 +436,24 @@ function createEmptySummary() {
     lastOutputTokens: 0,
     lastActionKind: '',
     lastRawToolCall: null,
+    lastWorkToolCall: null,
+    lastPostMessageText: '',
     lastRawReply: '',
     firstRawUserPrompt: '',
     estimated: false,
   };
+}
+
+function isPassiveSwarmOrMetaTool(tc) {
+  const name = tc?.name || '';
+  if (name === 'swarm_wait' || name === 'read_board' || name === 'update_focus' || name === 'update_steps') {
+    return true;
+  }
+  if (name === 'swarm') {
+    const action = deepUnquoteString(tc?.args?.action).trim().toLowerCase();
+    return action === 'status' || action === 'models';
+  }
+  return false;
 }
 
 function applyTranscriptLine(summary, lineText) {
@@ -347,6 +494,16 @@ function applyTranscriptLine(summary, lineText) {
     if (Array.isArray(obj.tool_calls) && obj.tool_calls.length) {
       summary.lastActionKind = 'tool';
       summary.lastRawToolCall = obj.tool_calls[obj.tool_calls.length - 1];
+      for (const tc of obj.tool_calls) {
+        if (!tc || typeof tc !== 'object') continue;
+        if (tc.name === 'post_message') {
+          const msgTxt = deepUnquoteString(tc?.args?.text).trim();
+          if (msgTxt) summary.lastPostMessageText = msgTxt.slice(0, 300);
+        }
+        if (!isPassiveSwarmOrMetaTool(tc)) {
+          summary.lastWorkToolCall = tc;
+        }
+      }
     } else if (obj.content) {
       summary.lastActionKind = 'reply';
       summary.lastRawToolCall = null;
@@ -611,9 +768,40 @@ export async function buildGroupSnapshot(activeConvId) {
     return { status: 'empty', activeConversationId: cleanActive, rootConversationId: rootId };
   }
 
-  // BFS/DFS 构建扁平节点列表与树边
+  // BFS/DFS 构建扁平节点列表与树边（融合 subagents/*.json 与 Swarm members.json/plan.json）
   const rawNodes = [];
+  const rawNodesById = new Map();
   const visited = new Set();
+  const swarmMetaByRoot = new Map();
+  const swarmMembersByConvId = new Map();
+  const swarmWorkersByOwner = new Map();
+
+  function resolveSwarmOwnerId(worker, fallbackOwnerId, swarmMeta) {
+    if (!worker?.addedBy) return fallbackOwnerId;
+    const byName = swarmMeta.convIdByName.get(worker.addedBy);
+    const cand = byName || (swarmMeta.membersByConvId.has(worker.addedBy) ? worker.addedBy : '');
+    if (cand && cand !== worker.conversationId && ID_RE.test(cand)) {
+      return cand;
+    }
+    return fallbackOwnerId;
+  }
+
+  function makeSynthesizedSwarmChild(worker) {
+    return {
+      conversationId: worker.conversationId,
+      typeName: worker.role || 'worker',
+      role: worker.name || worker.conversationId.slice(0, 8),
+      subagentState: worker.killed ? 'SUBAGENT_STATE_KILLED' : 'SUBAGENT_STATE_ALIVE',
+      spawnStepIndex: null,
+      workspaceUris: [],
+      isSwarmMember: true,
+      swarmMemberName: worker.name || '',
+      swarmTask: worker.task || '',
+      swarmWorkspaceMode: worker.workspaceMode || '',
+      swarmPhase: worker.phase || '',
+      swarmModelFallback: worker.model || '',
+    };
+  }
 
   function walk(convId, parentId, depth, metaFromParent) {
     if (visited.has(convId) || depth > MAX_TREE_DEPTH) return;
@@ -625,7 +813,57 @@ export async function buildGroupSnapshot(activeConvId) {
       ? readTranscriptSummaryIncremental(tpPath)
       : { summary: null, transcriptKey: 'missing' };
 
-    const childrenDescs = loc ? readSubagentDescriptors(loc.convDir) : [];
+    const swarmMeta = loc ? readSwarmMetadata(loc.convDir) : null;
+    if (swarmMeta?.detected) {
+      swarmMetaByRoot.set(convId, swarmMeta);
+      for (const [cid, member] of swarmMeta.membersByConvId.entries()) {
+        if (!swarmMembersByConvId.has(cid)) {
+          swarmMembersByConvId.set(cid, member);
+        }
+      }
+      for (const worker of swarmMeta.orderedWorkers) {
+        if (!worker.conversationId || !ID_RE.test(worker.conversationId) || worker.conversationId === convId) continue;
+        const ownerId = resolveSwarmOwnerId(worker, convId, swarmMeta);
+        if (!swarmWorkersByOwner.has(ownerId)) swarmWorkersByOwner.set(ownerId, []);
+        swarmWorkersByOwner.get(ownerId).push(worker);
+      }
+    }
+
+    const subagentDescs = loc ? readSubagentDescriptors(loc.convDir) : [];
+    const mergedChildren = [];
+    const seenChildIds = new Set();
+
+    for (const sub of subagentDescs) {
+      if (seenChildIds.has(sub.conversationId)) continue;
+      seenChildIds.add(sub.conversationId);
+      const cleanedRole = stripSwarmRoleWrapper(sub.role);
+      const wasWrapped = cleanedRole !== sub.role;
+      const member = swarmMembersByConvId.get(sub.conversationId);
+      mergedChildren.push({
+        ...sub,
+        role: member?.name || cleanedRole,
+        subagentState: member?.killed ? 'SUBAGENT_STATE_KILLED' : sub.subagentState,
+        isSwarmMember: Boolean(member || wasWrapped),
+        swarmMemberName: member?.name || (wasWrapped ? cleanedRole : ''),
+        swarmTask: member?.task || '',
+        swarmWorkspaceMode: member?.workspaceMode || '',
+        swarmPhase: member?.phase || '',
+        swarmModelFallback: member?.model || '',
+      });
+    }
+
+    for (const worker of swarmWorkersByOwner.get(convId) || []) {
+      if (seenChildIds.has(worker.conversationId)) continue;
+      seenChildIds.add(worker.conversationId);
+      mergedChildren.push(makeSynthesizedSwarmChild(worker));
+    }
+
+    const selfMember = swarmMembersByConvId.get(convId);
+    const cleanedMetaRole = stripSwarmRoleWrapper(metaFromParent?.role || '');
+    const metaWasWrapped = Boolean(metaFromParent?.role && cleanedMetaRole !== metaFromParent.role);
+    const isSwarmMember = depth === 0 ? false : Boolean(metaFromParent?.isSwarmMember || selfMember || metaWasWrapped);
+    const swarmMemberName =
+      depth === 0 ? '' : metaFromParent?.swarmMemberName || selfMember?.name || (metaWasWrapped ? cleanedMetaRole : '');
 
     const node = {
       conversationId: convId,
@@ -634,23 +872,48 @@ export async function buildGroupSnapshot(activeConvId) {
       isRoot: depth === 0,
       isActiveView: convId === cleanActive,
       typeName: depth === 0 ? 'coordinator' : metaFromParent?.typeName || 'subagent',
-      role: depth === 0 ? '主会话 (Root)' : metaFromParent?.role || convId.slice(0, 8),
-      subagentState: depth === 0 ? 'SUBAGENT_STATE_ALIVE' : metaFromParent?.subagentState || 'SUBAGENT_STATE_ALIVE',
+      role: depth === 0 ? '主会话 (Root)' : swarmMemberName || cleanedMetaRole || convId.slice(0, 8),
+      subagentState:
+        depth === 0
+          ? 'SUBAGENT_STATE_ALIVE'
+          : selfMember?.killed
+            ? 'SUBAGENT_STATE_KILLED'
+            : metaFromParent?.subagentState || 'SUBAGENT_STATE_ALIVE',
       spawnStepIndex: metaFromParent?.spawnStepIndex ?? null,
       workspaceUris: metaFromParent?.workspaceUris || [],
+      isSwarmMember,
+      swarmMemberName,
+      swarmTask: depth === 0 ? '' : metaFromParent?.swarmTask || selfMember?.task || '',
+      swarmWorkspaceMode: metaFromParent?.swarmWorkspaceMode || selfMember?.workspaceMode || '',
+      swarmPhase: metaFromParent?.swarmPhase || selfMember?.phase || '',
+      swarmModelFallback: metaFromParent?.swarmModelFallback || selfMember?.model || '',
       loc,
       txSummary,
       transcriptKey,
-      childrenIds: childrenDescs.map((c) => c.conversationId),
+      childrenIds: mergedChildren.map((c) => c.conversationId),
     };
     rawNodes.push(node);
+    rawNodesById.set(convId, node);
 
-    for (const child of childrenDescs) {
+    for (const child of mergedChildren) {
       walk(child.conversationId, convId, depth + 1, child);
     }
   }
 
   walk(rootId, null, 0, null);
+
+  // 兜底：若某个 worker 的 added_by 指向了未出现在树中的成员，将其挂到对应的 Swarm 根下避免遗漏
+  for (const [swarmRootId, swarmMeta] of swarmMetaByRoot.entries()) {
+    const swarmRootNode = rawNodesById.get(swarmRootId);
+    if (!swarmRootNode) continue;
+    for (const worker of swarmMeta.orderedWorkers) {
+      if (!worker.conversationId || !ID_RE.test(worker.conversationId) || visited.has(worker.conversationId)) continue;
+      if (!swarmRootNode.childrenIds.includes(worker.conversationId)) {
+        swarmRootNode.childrenIds.push(worker.conversationId);
+      }
+      walk(worker.conversationId, swarmRootId, swarmRootNode.depth + 1, makeSynthesizedSwarmChild(worker));
+    }
+  }
 
   // 并发拉取 LS 实时状态与上下文数据（并发度 4）
   const preloadedRoot = activeConvResp?.id === rootId ? activeConvResp : null;
@@ -694,8 +957,9 @@ export async function buildGroupSnapshot(activeConvId) {
         ? convMeta?.annotations?.title || convMeta?.state?.summary
         : '';
 
-    const modelId = gen?.genModelId || tx?.lastModel || '';
-    const modelLabel = formatModelLabel(gen?.genModelId, gen?.modelDisplayName, tx?.lastModel, catalog);
+    const effectiveTranscriptModel = tx?.lastModel || raw.swarmModelFallback || '';
+    const modelId = gen?.genModelId || effectiveTranscriptModel || '';
+    const modelLabel = formatModelLabel(gen?.genModelId, gen?.modelDisplayName, effectiveTranscriptModel, catalog);
     const catalogEntry = modelId ? catalog[modelId] || null : null;
 
     const maxContextTokens = gen?.maxContextTokens || 512000;
@@ -719,8 +983,22 @@ export async function buildGroupSnapshot(activeConvId) {
     maxDepth = Math.max(maxDepth, raw.depth);
 
     const cleanReply = tx?.lastRawReply ? cleanActivitySummary(tx.lastRawReply, workspaceRoots, roleById, 110) : '';
+    const latestToolName = tx?.lastActionKind === 'tool' ? tx?.lastRawToolCall?.name || '' : '';
+    const isSwarmIdleWait =
+      (status === 'waiting' || status === 'idle') &&
+      (latestToolName === 'swarm_wait' || latestToolName === 'read_board');
+    const cleanPostMsg = tx?.lastPostMessageText
+      ? cleanActivitySummary(tx.lastPostMessageText, workspaceRoots, roleById, 76)
+      : '';
+    const cleanSwarmTask = raw.swarmTask
+      ? cleanActivitySummary(raw.swarmTask, workspaceRoots, roleById, 76)
+      : '';
+
     let currentActivity = '';
-    if (tx?.lastActionKind === 'tool' && tx?.lastRawToolCall) {
+    if (isSwarmIdleWait) {
+      const waitContext = cleanPostMsg || cleanReply || cleanSwarmTask;
+      currentActivity = waitContext ? `等待群消息 · ${waitContext}` : '等待群消息';
+    } else if (tx?.lastActionKind === 'tool' && tx?.lastRawToolCall) {
       currentActivity = summarizeToolCallBrief(tx.lastRawToolCall, workspaceRoots, roleById);
     } else if (cleanReply) {
       currentActivity = cleanReply;
@@ -735,13 +1013,17 @@ export async function buildGroupSnapshot(activeConvId) {
       isRoot: raw.isRoot,
       isActiveView: raw.isActiveView,
       typeName: raw.typeName,
-      role: raw.isRoot ? rootDisplayTitle || '主会话 (Root)' : raw.role,
+      role: raw.isRoot ? rootDisplayTitle || '主会话 (Root)' : stripSwarmRoleWrapper(raw.role),
       title: convMeta?.annotations?.title || convMeta?.state?.summary || '',
       subagentState: raw.subagentState,
       runState,
       status,
       spawnStepIndex: raw.spawnStepIndex,
       childrenIds: raw.childrenIds,
+      isSwarmMember: Boolean(raw.isSwarmMember),
+      swarmMemberName: raw.swarmMemberName || '',
+      swarmTask: raw.swarmTask || '',
+      swarmWorkspaceMode: raw.swarmWorkspaceMode || '',
       modelId,
       modelLabel,
       shortModelLabel: formatShortModelLabel(modelLabel),
@@ -773,15 +1055,48 @@ export async function buildGroupSnapshot(activeConvId) {
     orderedNodes.push(enriched);
   }
 
+  // 聚合消息流与 Teamwork 文档（融合 Swarm board.jsonl）
+  const { messages, boardBySeq, boardCount, primarySwarmRootId, primarySwarmConvByName, primarySwarmRootDir, nudgeTimestampsBySeq } =
+    collectGroupMessages(rawNodes, nodesById, swarmMetaByRoot);
+  const teamwork = discoverTeamworkDocs(rawNodes, messages);
+
+  const primarySwarmMeta =
+    swarmMetaByRoot.get(rootId) || (primarySwarmRootId ? swarmMetaByRoot.get(primarySwarmRootId) : null);
+  const swarmModelByConvId = {};
+  for (const raw of rawNodes) {
+    if (raw.swarmModelFallback) {
+      swarmModelByConvId[raw.conversationId] = raw.swarmModelFallback;
+    }
+  }
+
   // 更新组上下文缓存，供 readAgentDetail 复用
-  const groupCtx = { rootId, workspaceRoots, roleById, updatedAt: Date.now() };
+  const groupCtx = {
+    rootId,
+    workspaceRoots,
+    roleById,
+    swarmRootId: primarySwarmRootId || '',
+    swarmRootDir: primarySwarmRootDir || '',
+    swarmBoardBySeq: boardBySeq,
+    swarmConvByName: primarySwarmConvByName || new Map(),
+    swarmModelByConvId,
+    nudgeTimestampsBySeq,
+    updatedAt: Date.now(),
+  };
   for (const n of orderedNodes) {
     lruSet(groupContextByConv, n.conversationId, groupCtx, 256);
   }
 
-  // 聚合消息流与 Teamwork 文档
-  const messages = collectGroupMessages(rawNodes, nodesById);
-  const teamwork = discoverTeamworkDocs(rawNodes, messages);
+  const swarmSummary = primarySwarmMeta?.detected
+    ? {
+        detected: true,
+        title: primarySwarmMeta.title || primarySwarmMeta.goalTitle || '',
+        goalTitle: primarySwarmMeta.goalTitle || '',
+        goalLine: primarySwarmMeta.goalLine || '',
+        boardCount,
+        membersCount:
+          primarySwarmMeta.membersByConvId.size || orderedNodes.filter((n) => n.isSwarmMember || n.isRoot).length,
+      }
+    : { detected: false };
 
   // 计算全组统计摘要
   let runningCount = 0;
@@ -862,52 +1177,157 @@ export async function buildGroupSnapshot(activeConvId) {
     nodes: orderedNodes,
     workspaceRoots,
     roleById,
+    swarm: swarmSummary,
     messages,
     teamwork,
   };
 }
 
 /**
- * 获取指定会话所属组的 roleById 与 workspaceRoots 上下文（优先命中缓存，否则仅本地扫描子树）。
+ * 获取指定会话所属组的 roleById、workspaceRoots 与 Swarm 上下文（优先命中缓存，否则仅本地扫描子树）。
  */
 export async function getCachedGroupContext(convId) {
   const hit = groupContextByConv.get(convId);
   if (hit && Date.now() - hit.updatedAt < 15000) {
+    if (hit.swarmRootDir && hit.swarmRootId) {
+      // board.jsonl 经 mtimeMs:size:ino 缓存，热路径仅一次 statSync，确保新群消息实时可见
+      const boardRes = readSwarmBoard(hit.swarmRootDir, {
+        convIdByName: hit.swarmConvByName,
+        rootConvId: hit.swarmRootId,
+        rootLabel: hit.roleById?.[hit.swarmRootId] || '主会话 (Root)',
+        nudgeTimestampsBySeq: hit.nudgeTimestampsBySeq,
+      });
+      hit.swarmBoardBySeq = boardRes.bySeq;
+    }
     return hit;
   }
   const { rootId } = await resolveRootConversation(convId);
-  if (!rootId) return { rootId: convId, workspaceRoots: [], roleById: {} };
+  if (!rootId) {
+    return {
+      rootId: convId,
+      workspaceRoots: [],
+      roleById: {},
+      swarmRootId: '',
+      swarmBoardBySeq: new Map(),
+      swarmConvByName: new Map(),
+      swarmModelByConvId: {},
+    };
+  }
 
   const roleById = { [rootId]: '主会话 (Root)' };
   const uris = [];
   const visited = new Set();
+  const convDirs = [];
+  const swarmModelByConvId = {};
+  let swarmRootId = '';
+  let swarmRootDir = '';
+  let swarmMetaFound = null;
 
   function walkLocal(id, depth) {
     if (visited.has(id) || depth > MAX_TREE_DEPTH) return;
     visited.add(id);
     const loc = findConvLocation(id);
     if (!loc) return;
+    convDirs.push(loc.convDir);
+
+    const swarmMeta = readSwarmMetadata(loc.convDir);
+    if (swarmMeta.detected && !swarmMetaFound) {
+      swarmRootId = id;
+      swarmRootDir = loc.convDir;
+      swarmMetaFound = swarmMeta;
+    }
+
+    const nextIds = new Set();
     for (const child of readSubagentDescriptors(loc.convDir)) {
-      roleById[child.conversationId] = child.role;
+      const cleaned = stripSwarmRoleWrapper(child.role);
+      const member = swarmMetaFound?.membersByConvId.get(child.conversationId);
+      roleById[child.conversationId] = member?.name || cleaned;
+      if (member?.model) swarmModelByConvId[child.conversationId] = member.model;
       for (const u of child.workspaceUris || []) uris.push(u);
-      walkLocal(child.conversationId, depth + 1);
+      nextIds.add(child.conversationId);
+    }
+    if (swarmMeta.detected) {
+      for (const [cid, m] of swarmMeta.membersByConvId.entries()) {
+        if (m.model) swarmModelByConvId[cid] = m.model;
+        if (cid !== id && !m.isCoordinator) {
+          roleById[cid] = m.name || roleById[cid] || cid.slice(0, 8);
+          nextIds.add(cid);
+        }
+      }
+    }
+    for (const nextId of nextIds) {
+      walkLocal(nextId, depth + 1);
     }
   }
   walkLocal(rootId, 0);
 
-  const ctx = { rootId, workspaceRoots: extractWorkspaceRoots(uris), roleById, updatedAt: Date.now() };
+  let swarmBoardBySeq = new Map();
+  let nudgeTimestampsBySeq = new Map();
+  if (swarmMetaFound?.detected && swarmRootDir) {
+    nudgeTimestampsBySeq = collectNudgeTimestampsFromDirs(convDirs);
+    const boardRes = readSwarmBoard(swarmRootDir, {
+      convIdByName: swarmMetaFound.convIdByName,
+      rootConvId: swarmRootId,
+      rootLabel: roleById[swarmRootId] || '主会话 (Root)',
+      nudgeTimestampsBySeq,
+    });
+    swarmBoardBySeq = boardRes.bySeq;
+  }
+
+  const ctx = {
+    rootId,
+    workspaceRoots: extractWorkspaceRoots(uris),
+    roleById,
+    swarmRootId,
+    swarmRootDir,
+    swarmBoardBySeq,
+    swarmConvByName: swarmMetaFound?.convIdByName || new Map(),
+    swarmModelByConvId,
+    nudgeTimestampsBySeq,
+    updatedAt: Date.now(),
+  };
   for (const id of visited) {
     lruSet(groupContextByConv, id, ctx, 256);
   }
   return ctx;
 }
 
+const SWARM_NUDGE_RE = /^\[swarm\]\s+new board message #(\d+)/i;
+const SWARM_BRIEF_DUP_RE = /^You have just started\.\s+Your assignment\s*\(recorded on the board as #(\d+)\b/i;
+
+function recordNudgeTimestamp(nudgeTimestampsBySeq, content, timestamp) {
+  if (!timestamp) return;
+  const trimmed = String(content || '').trim();
+  const nudgeMatch = SWARM_NUDGE_RE.exec(trimmed);
+  const seq = nudgeMatch ? Number(nudgeMatch[1]) : 0;
+  if (seq > 0 && !nudgeTimestampsBySeq.has(seq)) {
+    nudgeTimestampsBySeq.set(seq, timestamp);
+  }
+}
+
+function collectNudgeTimestampsFromDirs(convDirs) {
+  const nudgeTimestampsBySeq = new Map();
+  for (const convDir of convDirs) {
+    const msgDir = join(convDir, '.system_generated', 'messages');
+    if (!existsSync(msgDir)) continue;
+    for (const fn of safeReaddir(msgDir)) {
+      if (!fn.endsWith('.json') || fn === 'read.json') continue;
+      const msg = readJsonCached(messageFileCache, join(msgDir, fn), 2048);
+      if (msg && typeof msg === 'object') {
+        recordNudgeTimestamp(nudgeTimestampsBySeq, msg.content, msg.timestamp);
+      }
+    }
+  }
+  return nudgeTimestampsBySeq;
+}
+
 /**
- * 聚合整棵子代理树内所有节点的 .system_generated/messages/*.json。
+ * 聚合整棵子代理树内所有节点的 .system_generated/messages/*.json 与 Swarm board.jsonl。
  */
-function collectGroupMessages(rawNodes, nodesById) {
+function collectGroupMessages(rawNodes, nodesById, swarmMetaByRoot = new Map()) {
   const seenIds = new Set();
-  const list = [];
+  const regularEntries = [];
+  const nudgeTimestampsBySeq = new Map();
 
   const resolveSender = (rawSender) => {
     const s = String(rawSender || '').trim();
@@ -941,14 +1361,18 @@ function collectGroupMessages(rawNodes, nodesById) {
       if (seenIds.has(id)) continue;
       seenIds.add(id);
 
+      const content = String(msg.content || '');
+      recordNudgeTimestamp(nudgeTimestampsBySeq, content, msg.timestamp);
+      if (!content.trim()) continue;
+
       const senderInfo = resolveSender(msg.sender);
       const recipInfo = resolveSender(msg.recipient || node.conversationId);
       const toolName = msg?.sourceMetadata?.tool?.toolCall?.name || '';
       const title = msg?.renderDetails?.messageTitle || '';
-      const isCron = senderInfo.isCron || /^cron\b/i.test(title) || /^\[Cron\b/i.test(msg.content || '');
+      const isCron = senderInfo.isCron || /^cron\b/i.test(title) || /^\[Cron\b/i.test(content);
       const kind = isCron ? 'cron' : toolName === 'invoke_subagent' ? 'spawn' : 'message';
 
-      list.push({
+      regularEntries.push({
         id,
         kind,
         isCron,
@@ -962,13 +1386,71 @@ function collectGroupMessages(rawNodes, nodesById) {
         recipientLabel: recipInfo.label,
         title,
         priority: msg.priority || '',
-        content: String(msg.content || ''),
+        content,
       });
     }
   }
 
-  list.sort((a, b) => a.timestampMs - b.timestampMs);
-  return list;
+  const boardMessages = [];
+  const combinedBoardBySeq = new Map();
+  let primarySwarmRootId = '';
+  let primarySwarmConvByName = null;
+  let primarySwarmRootDir = '';
+
+  const nodeByIdRaw = new Map(rawNodes.map((n) => [n.conversationId, n]));
+  for (const [swarmRootId, meta] of swarmMetaByRoot.entries()) {
+    const swarmNode = nodeByIdRaw.get(swarmRootId);
+    if (!swarmNode?.loc) continue;
+    const boardRes = readSwarmBoard(swarmNode.loc.convDir, {
+      convIdByName: meta.convIdByName,
+      rootConvId: swarmRootId,
+      rootLabel: nodesById[swarmRootId]?.role || '主会话 (Root)',
+      nudgeTimestampsBySeq,
+    });
+    if (!primarySwarmRootId) {
+      primarySwarmRootId = swarmRootId;
+      primarySwarmConvByName = meta.convIdByName;
+      primarySwarmRootDir = swarmNode.loc.convDir;
+    }
+    for (const bm of boardRes.messages) {
+      boardMessages.push(bm);
+    }
+    for (const [seq, bm] of boardRes.bySeq.entries()) {
+      if (!combinedBoardBySeq.has(seq)) {
+        combinedBoardBySeq.set(seq, bm);
+      }
+    }
+  }
+
+  // 过滤已被 board.jsonl 覆盖的空壳唤醒与重复派单消息
+  const filteredRegular = regularEntries.filter((item) => {
+    const trimmed = item.content.trim();
+    const nudgeMatch = SWARM_NUDGE_RE.exec(trimmed);
+    if (nudgeMatch && combinedBoardBySeq.has(Number(nudgeMatch[1]))) {
+      return false;
+    }
+    const briefMatch = SWARM_BRIEF_DUP_RE.exec(trimmed);
+    if (briefMatch && combinedBoardBySeq.has(Number(briefMatch[1]))) {
+      return false;
+    }
+    return true;
+  });
+
+  const list = [...boardMessages, ...filteredRegular];
+  list.sort((a, b) => {
+    if (a.timestampMs !== b.timestampMs) return a.timestampMs - b.timestampMs;
+    return (a.seq || 0) - (b.seq || 0);
+  });
+
+  return {
+    messages: list,
+    boardBySeq: combinedBoardBySeq,
+    boardCount: boardMessages.length,
+    primarySwarmRootId,
+    primarySwarmConvByName,
+    primarySwarmRootDir,
+    nudgeTimestampsBySeq,
+  };
 }
 
 /**
