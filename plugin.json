@@ -1,0 +1,14 @@
+{
+  "name": "subagent-board",
+  "displayName": "子代理组看板 (Subagent Board)",
+  "description": "面向 Antigravity 2.0 的通用子代理组可视化看板：统一监控 /teamwork、invoke_subagent 等多层子代理的实时状态、模型、上下文消耗、代理间消息流与完整对话。",
+  "version": "1.0.0",
+  "homepage": "https://github.com/thedawn3/antigravity-subagent-board",
+  "repository": "https://github.com/thedawn3/antigravity-subagent-board",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "打开子代理组看板",
+    "巡检当前子代理组的模型分配与上下文消耗",
+    "排查当前子代理组中卡住或高消耗的子代理"
+  ]
+}

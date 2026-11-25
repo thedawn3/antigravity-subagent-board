@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="frame-src 'none'; child-src 'none'">
+  <title>子代理组看板</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- 骨架屏 Loading：避免打开时闪烁空白 -->
+  <div id="main-loading" class="loading" aria-live="polite" aria-busy="true">
+    <div class="skel-head">
+      <span class="skel skel-line" style="width: 48%; height: 14px"></span>
+      <span class="skel skel-line" style="width: 24%"></span>
+    </div>
+    <div class="skel-tabs">
+      <span class="skel skel-tab"></span>
+      <span class="skel skel-tab"></span>
+      <span class="skel skel-tab"></span>
+    </div>
+    <div class="skel-rows" aria-hidden="true">
+      <div class="skel-stack"><span class="skel skel-line" style="width: 36%"></span><span class="skel skel-line" style="width: 86%"></span></div>
+      <div class="skel-stack"><span class="skel skel-line" style="width: 44%"></span><span class="skel skel-line" style="width: 72%"></span></div>
+      <div class="skel-stack"><span class="skel skel-line" style="width: 28%"></span><span class="skel skel-line" style="width: 90%"></span></div>
+    </div>
+    <p class="loading-caption">正在扫描当前会话及子代理树…</p>
+  </div>
+
+  <!-- 空态 -->
+  <main id="main-empty" class="empty hidden">
+    <div class="empty-card">
+      <p id="empty-reason" class="empty-title">当前窗口尚未绑定会话</p>
+      <p class="empty-body">打开或发送一条消息后，子代理组状态将自动在此显示。</p>
+    </div>
+  </main>
+
+  <!-- 主应用 -->
+  <div id="app" class="board hidden">
+    <header id="header" class="header">
+      <div class="header-row">
+        <h1 id="root-title" class="board-title" title="">子代理组看板</h1>
+        <span id="live-status" class="live" role="status" title="页面可见时每 2.5 秒同步">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="live-label" class="live-label">空闲</span>
+        </span>
+        <button id="btn-stats" type="button" class="icon-btn" popovertarget="stats-popover" title="全组资源与模型统计" aria-label="全组统计">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 13V8M8 13V3M13 13V6"/></svg>
+        </button>
+        <button id="btn-refresh" type="button" class="icon-btn" title="立即刷新" aria-label="立即刷新">
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.6M13.5 2.5v2.4h-2.4"/></svg>
+        </button>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="看板视图">
+        <button type="button" class="tab active" data-tab="overview" role="tab" aria-selected="true">
+          总览 <span id="tab-tree-count" class="tab-count"></span>
+        </button>
+        <button type="button" class="tab" data-tab="messages" role="tab" aria-selected="false" tabindex="-1">
+          消息板 <span id="tab-msg-count" class="tab-count"></span>
+        </button>
+        <button type="button" id="tab-btn-teamwork" class="tab hidden" data-tab="teamwork" role="tab" aria-selected="false" tabindex="-1">
+          工件 <span id="tab-tw-count" class="tab-count"></span>
+        </button>
+      </nav>
+    </header>
+
+    <!-- 全组指标 Popover 浮层 -->
+    <div id="stats-popover" popover="auto" class="stats-popover" aria-label="全组资源统计">
+      <div class="pop-head">
+        <span class="pop-title">全组资源与模型分布</span>
+        <span id="pop-agent-counts" class="pop-sub mono"></span>
+      </div>
+      <div class="pop-grid">
+        <div class="pop-kv"><span class="pop-k">活跃 Prompt 合计</span><span id="sum-prompt" class="pop-v mono">-</span></div>
+        <div class="pop-kv"><span class="pop-k">累计输出</span><span id="sum-output" class="pop-v mono">-</span></div>
+        <div class="pop-kv"><span class="pop-k">平均缓存命中</span><span id="sum-cache" class="pop-v mono">-</span></div>
+        <div class="pop-kv"><span class="pop-k">最高上下文水位</span><span id="sum-peak" class="pop-v mono">-</span></div>
+      </div>
+      <div id="model-dist" class="pop-models"></div>
+    </div>
+
+    <main class="main">
+      <!-- 视图 1：总览（窄屏列表/详情切换，宽屏自动 Master-Detail 分栏） -->
+      <section id="pane-overview" class="tab-body active" role="tabpanel">
+        <div id="workspace" class="workspace">
+          <!-- 左栏 / 窄屏主列表：焦点区 + 完整子代理树 -->
+          <div id="tree-pane" class="tree-pane">
+            <div class="toolbar">
+              <div class="searchbar">
+                <label class="search">
+                  <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25"/><path d="m10.25 10.25 3.25 3.25"/></svg>
+                  <input id="tree-search" type="search" placeholder="筛选角色、模型或当前动作" autocomplete="off">
+                </label>
+                <button id="tree-filter-toggle" type="button" class="icon-btn filter-toggle" aria-expanded="false" aria-controls="tree-filters" title="筛选选项">
+                  <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h11M4.5 8h7M6.5 11.5h3"/></svg>
+                  <span class="filter-dot" aria-hidden="true"></span>
+                </button>
+              </div>
+              <div id="tree-filters" class="filters hidden">
+                <div class="toolbar-row">
+                  <label class="switch"><input type="checkbox" id="tree-hide-killed"><span class="switch-track" aria-hidden="true"></span><span>隐藏已终止</span></label>
+                  <label class="switch"><input type="checkbox" id="tree-only-active"><span class="switch-track" aria-hidden="true"></span><span>仅看活跃/警戒</span></label>
+                  <span class="spacer"></span>
+                  <button id="btn-toggle-expand" type="button" class="ghost-btn">全部折叠</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 置顶焦点区：仅存在运行中/报错/高水位节点时出现 -->
+            <section id="focus-section" class="focus-box hidden" aria-label="当前焦点"></section>
+
+            <!-- 完整子代理层级树 -->
+            <div id="tree-list" class="tree-list" role="tree"></div>
+          </div>
+
+          <!-- 右栏 / 窄屏详情子视图：单代理上下文与对话流 -->
+          <div id="detail-pane" class="detail-pane">
+            <div class="detail-nav">
+              <button id="btn-back-overview" type="button" class="ghost-btn back-btn" title="返回子代理树 (Esc)">
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>
+                <span>返回总览</span>
+              </button>
+              <span class="select select-grow">
+                <select id="detail-agent-select" aria-label="切换查看代理"></select>
+              </span>
+              <button id="btn-open-conv" type="button" class="icon-btn" title="在主窗口切入原会话" aria-label="在主窗口切入原会话">
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 3.5H3.5v9h9v-3M9.5 2.5h4v4M13.5 2.5 7.5 8.5"/></svg>
+              </button>
+            </div>
+
+            <div class="detail-ctx">
+              <div class="detail-ctx-top">
+                <span id="d-model" class="mono-chip">-</span>
+                <span id="d-ctx-nums" class="mono small">-</span>
+                <span id="d-cache" class="muted small">-</span>
+                <span class="spacer"></span>
+                <button id="btn-toggle-breakdown" type="button" class="link-btn">分层明细</button>
+              </div>
+              <div class="progress-track"><div id="d-ctx-fill" class="progress-fill ok" style="width: 0%"></div></div>
+              <div id="d-io-tokens" class="muted small mono"></div>
+              <div id="d-breakdown-box" class="breakdown-box hidden"></div>
+            </div>
+
+            <div class="detail-controls">
+              <label class="switch"><input id="d-show-tools" type="checkbox" checked><span class="switch-track" aria-hidden="true"></span><span>工具轨</span></label>
+              <label class="switch"><input id="d-show-thinking" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span>思考</span></label>
+              <label class="switch"><input id="d-show-system" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span>系统消息</span></label>
+              <span class="spacer"></span>
+              <span id="detail-event-meta" class="muted small"></span>
+            </div>
+
+            <div class="chat-earlier">
+              <button id="btn-load-earlier" type="button" class="ghost-btn hidden">加载更早记录</button>
+            </div>
+            <div id="detail-chat-stream" class="chat-stream"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 视图 2：消息板（时间正序，极简 chat feed） -->
+      <section id="pane-messages" class="tab-body" role="tabpanel">
+        <div class="toolbar">
+          <div class="searchbar">
+            <label class="search">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25"/><path d="m10.25 10.25 3.25 3.25"/></svg>
+              <input id="msg-search" type="search" placeholder="搜索代理间消息内容" autocomplete="off">
+            </label>
+            <button id="msg-filter-toggle" type="button" class="icon-btn filter-toggle" aria-expanded="false" aria-controls="msg-filters" title="筛选选项">
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h11M4.5 8h7M6.5 11.5h3"/></svg>
+              <span class="filter-dot" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div id="msg-filters" class="filters hidden">
+            <div class="toolbar-row">
+              <span class="select"><select id="msg-agent-filter" aria-label="按成员筛选"><option value="">全部代理</option></select></span>
+              <span class="spacer"></span>
+              <label class="switch"><input id="msg-hide-cron" type="checkbox" checked><span class="switch-track" aria-hidden="true"></span><span>隐藏 Cron 心跳</span></label>
+            </div>
+          </div>
+        </div>
+        <div id="msg-list" class="feed"></div>
+      </section>
+
+      <!-- 视图 3：Teamwork 工件 -->
+      <section id="pane-teamwork" class="tab-body" role="tabpanel">
+        <div class="tw-layout">
+          <aside class="tw-sidebar">
+            <div id="tw-cat-pills" class="tw-cat-pills"></div>
+            <div class="tw-mobile-select-wrap">
+              <span class="select select-grow"><select id="tw-doc-select" aria-label="选择工件文档"></select></span>
+            </div>
+            <div id="tw-doc-list" class="tw-doc-list"></div>
+          </aside>
+          <article class="tw-viewer">
+            <div class="tw-viewer-head">
+              <div class="tw-title-group">
+                <span id="tw-doc-title" class="strong">请选择文档</span>
+                <span id="tw-doc-meta" class="muted small"></span>
+              </div>
+              <button id="btn-tw-open-file" type="button" class="ghost-btn hidden">在侧栏打开</button>
+            </div>
+            <div id="tw-doc-body" class="md tw-doc-body"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <!-- 悬浮回到底部胶囊 -->
+    <button id="jump-latest" type="button" class="jump hidden">
+      <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v9.5M4 9l4 4 4-4"/></svg>
+      <span>最新</span>
+    </button>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

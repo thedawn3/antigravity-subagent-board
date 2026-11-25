@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "子代理组看板",
+  "description": "实时查看当前会话整棵子代理树（兼容 /teamwork 与任意 invoke_subagent）的运行状态、所用模型、上下文占用、代理间消息流与完整对话。",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "子代理组看板",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "子代理组看板"
+      }
+    ]
+  }
+}
